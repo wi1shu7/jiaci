@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # jiaci 生产镜像：standalone 产物 + 运维工具（prisma CLI / tsx，用于 migrate deploy、seed、provision）
 FROM node:20-alpine AS deps
 WORKDIR /app

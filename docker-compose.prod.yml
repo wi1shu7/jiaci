@@ -8,7 +8,8 @@ services:
       POSTGRES_USER: aiword
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_is_required}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # 数据目录相对于 Compose 文件所在目录
+      - ./postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aiword -d aiword"]
       interval: 5s
@@ -31,9 +32,7 @@ services:
       # 绑定到宿主机回环地址，供反向代理访问
       - "127.0.0.1:${JIACI_APP_PORT:-3000}:3000"
     volumes:
-      - app_audio:/data/audio
+      - ./audio:/data/audio
     mem_limit: 512m
 
-volumes:
-  pgdata:
-  app_audio:
+# 数据通过相对路径 bind mount 落地（./postgres、./audio），不使用命名卷

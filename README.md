@@ -131,7 +131,11 @@ npm run categories:build -- --dry-run    # 先看每个类别的词数与找不�
 npm run categories:build
 ```
 
-词条的 AI 资料可用 `npm run ai:fill` 填充，需要在 `.env` 里配置模型密钥。详情页首次生成优先使用已配置的 DeepSeek，其次 OpenAI。重新解析使用当前显示的来源。DeepSeek 使用 `DEEPSEEK_API_KEY`，OpenAI 默认使用 `OPENROUTER_API_KEY`。同时配置 `OPENAI_RESPONSES_BASE_URL`、`OPENAI_RESPONSES_MODEL` 和 `OPENAI_API_KEY` 后，详情页的 OpenAI 来源会改用 Responses 接口。
+词条的 AI 资料可用 `npm run ai:fill` 填充，需要在 `.env` 里配置模型密钥。详情页首次生成优先使用已配置的 DeepSeek，其次 OpenAI。重新解析使用当前显示的来源。DeepSeek 使用 `DEEPSEEK_API_KEY`，OpenAI 默认使用 `OPENROUTER_API_KEY`。
+
+在 `.env` 中同时配置 `OPENAI_RESPONSES_BASE_URL`、`OPENAI_RESPONSES_MODEL` 和 `OPENAI_API_KEY`，详情页的 OpenAI 来源和 `npm run ai:fill -- --provider openai` 就会使用 Responses 接口。OpenAI 直连地址为 `https://api.openai.com/v1`。自建网关填写自己的 API 基础地址。Docker Desktop 容器访问宿主机上的网关时，主机名可用 `host.docker.internal`。
+
+`OPENAI_RESPONSES_REASONING_EFFORT` 可填任意字符串。Jiaci 将它原样传给 `reasoning.effort`，档位是否适用由上游判断。留空时使用上游默认行为。接口明确报告推理字段不受支持时，Jiaci 会省略该字段重试一次。推理 Token 计入 `ai.max_tokens` 对应的输出预算，批量填充会单独显示其中的推理用量。Responses 的 `--max-cost` 依据上游返回的计费金额，遇到未提供金额的响应时暂停后续请求。
 
 发音音频用 `npm run audio:generate` 生成（Edge-TTS，免费，也可换成自托管的 Kokoro）。详情用词典释义兜底，发音缺文件时按需合成、再不行退到浏览器语音。各脚本的参数见文件头部注释。
 

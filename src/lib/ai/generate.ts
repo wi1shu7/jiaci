@@ -135,9 +135,10 @@ async function fillWord(w: FillWordInput, provider: AiProvider): Promise<{ row: 
     let text: string;
     try {
       const userMessage = buildUserMessage(w, feedback);
-      text = responses
+      const result = responses
         ? await responsesJson(responses, SYSTEM_PROMPT, userMessage, budget)
-        : (await chatJson(provider, model, SYSTEM_PROMPT, userMessage, { maxTokens: budget })).text;
+        : await chatJson(provider, model, SYSTEM_PROMPT, userMessage, { maxTokens: budget });
+      text = result.text;
     } catch (e) {
       if (attempt >= 2) throw e;
       if (e instanceof ApiCallError && e.truncated) { budget = Math.ceil(budget * 1.5); continue; }

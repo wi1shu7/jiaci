@@ -29,8 +29,10 @@ RUN mkdir -p /data/audio && chown -R node:node /data /app
 COPY --from=build --chown=node:node /app/.next/standalone /app/
 COPY --from=build --chown=node:node /app/.next/static /app/.next/static/
 COPY --from=build --chown=node:node /app/public /app/public/
-# 完整依赖（含 prisma CLI、tsx）覆盖 standalone 的精简 node_modules，供一次性运维命令使用
+# 完整依赖（含 prisma CLI、tsx）覆盖 standalone 的精简 node_modules，供一次性运维命令使用；
+# 补上 build 阶段已生成的 prisma client（deps 层从未 generate）
 COPY --from=deps --chown=node:node /app/node_modules /app/node_modules/
+COPY --from=build --chown=node:node /app/node_modules/.prisma /app/node_modules/.prisma/
 COPY --from=build --chown=node:node /app/prisma /app/prisma/
 COPY --from=build --chown=node:node /app/scripts /app/scripts/
 COPY --from=build --chown=node:node /app/src/lib/auth-mode.ts /app/src/lib/auth-mode.ts

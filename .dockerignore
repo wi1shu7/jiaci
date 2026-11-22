@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.env
+.env.local
+*.tsbuildinfo
+e2e
+tests
+data
+storage
+*.log
+临时产物清单.md

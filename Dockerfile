@@ -35,7 +35,7 @@ COPY --from=deps --chown=node:node /app/node_modules /app/node_modules/
 COPY --from=build --chown=node:node /app/node_modules/.prisma /app/node_modules/.prisma/
 COPY --from=build --chown=node:node /app/prisma /app/prisma/
 COPY --from=build --chown=node:node /app/scripts /app/scripts/
-COPY --from=build --chown=node:node /app/src/lib/auth-mode.ts /app/src/lib/auth-mode.ts
+COPY --from=build --chown=node:node /app/src/lib /app/src/lib/
 USER node
 EXPOSE 3000
 CMD ["node", "server.js"]

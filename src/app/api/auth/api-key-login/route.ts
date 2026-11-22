@@ -3,7 +3,7 @@ import { handle, ok, readJson, fail, ApiError } from "@/lib/api";
 import { createSession } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { allow, clientIp } from "@/lib/rate-limit";
-import { getAuthMode, getPrivateUserEmail, verifyPrivateApiKey } from "@/lib/auth-mode";
+import { getAuthMode, getPrivateUserEmailForKey } from "@/lib/auth-mode";
 
 export const runtime = "nodejs";
 export const POST = handle(async (req) => {
@@ -21,12 +21,13 @@ export const POST = handle(async (req) => {
 
   // Always validate the configured secret on the server. Never expose it via
   // NEXT_PUBLIC_* or /api/config/public.
-  if (!verifyPrivateApiKey(apiKey)) {
+  const email = getPrivateUserEmailForKey(apiKey);
+  if (!email) {
     throw new ApiError(401, "登录密钥不正确", "invalid_credentials");
   }
 
   const user = await prisma.user.findUnique({
-    where: { email: getPrivateUserEmail() },
+    where: { email },
     select: { id: true, deletedAt: true },
   });
   if (!user || user.deletedAt) {

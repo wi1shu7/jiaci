@@ -1,4 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
+import { isValidEmail, normalizeEmail } from "./email";
 
 /** Both modes are exclusive. Unknown settings fail closed instead of falling back. */
 export type AuthMode = "email" | "api_key";
@@ -9,23 +11,40 @@ export function getAuthMode(): AuthMode {
   throw new Error("AUTH_MODE must be email or api_key");
 }
 
-/** For API-key mode, the server holds one 256-bit random key as 64 hex chars. */
-export function verifyPrivateApiKey(candidate: string): boolean {
-  const configured = (process.env.AUTH_API_KEY ?? "").trim();
-  if (!/^[0-9a-fA-F]{64}$/.test(configured)) {
-    throw new Error("AUTH_API_KEY must be a 64-character hexadecimal key in api_key mode");
+const bindingsSchema = z.array(z.object({
+  email: z.string().transform(normalizeEmail).refine((email) => email.length <= 254 && isValidEmail(email)),
+  key: z.string().trim().regex(/^[0-9a-fA-F]{64}$/),
+})).min(1);
+
+function getPrivateApiKeyBindings() {
+  const configured = process.env.AUTH_API_KEYS?.trim();
+  let input: unknown = [{ email: process.env.AUTH_PRIVATE_USER, key: process.env.AUTH_API_KEY }];
+  if (configured) {
+    try { input = JSON.parse(configured); }
+    catch { throw new Error("AUTH_API_KEYS must be a JSON array"); }
   }
-  // Hash both sides to make the timing-safe buffers an equal, constant length.
-  const a = createHash("sha256").update(candidate, "utf8").digest();
-  const b = createHash("sha256").update(configured, "utf8").digest();
-  return timingSafeEqual(a, b);
+
+  const parsed = bindingsSchema.safeParse(input);
+  if (!parsed.success) {
+    const name = configured ? "AUTH_API_KEYS" : "AUTH_API_KEY and AUTH_PRIVATE_USER";
+    throw new Error(`${name} must provide at least one binding with a valid email and a 64-character hexadecimal key`);
+  }
+  if (new Set(parsed.data.map(({ key }) => key)).size !== parsed.data.length) {
+    throw new Error("AUTH_API_KEYS must contain unique keys");
+  }
+  return parsed.data;
 }
 
-/** Account identity for study records, NOT an email login or delivery address. */
-export function getPrivateUserEmail(): string {
-  const email = (process.env.AUTH_PRIVATE_USER ?? "").trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
-    throw new Error("AUTH_PRIVATE_USER must be an email-formatted user identifier");
+export function getPrivateUserEmails(): string[] {
+  return [...new Set(getPrivateApiKeyBindings().map(({ email }) => email))];
+}
+
+export function getPrivateUserEmailForKey(candidate: string): string | null {
+  const candidateHash = createHash("sha256").update(candidate).digest();
+  let matchedEmail: string | null = null;
+  for (const { email, key } of getPrivateApiKeyBindings()) {
+    const keyHash = createHash("sha256").update(key).digest();
+    if (timingSafeEqual(candidateHash, keyHash)) matchedEmail = email;
   }
-  return email;
+  return matchedEmail;
 }

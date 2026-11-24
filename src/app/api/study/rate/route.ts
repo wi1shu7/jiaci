@@ -8,6 +8,7 @@ export const POST = withUser(async (req, _ctx, user) => {
   const body = z.object({
     wordId: z.string(), result: z.enum(["know", "fuzzy", "master", "reset", "remove"]),
     clientTs: z.string().max(64).optional(), date: z.string().optional(),
+    ratedAt: z.number().int().nonnegative().optional(), cardDueAt: z.iso.datetime().optional(),
     // 单词列表的「加进度」与跑步模式里的「加进度 / 已掌握」也走这里（要 know 的那几条守卫），但来源是 list：
     // 首页的「今日已完成」和当天新词配额只算学习卡上的打分（审计 F024）
     source: z.enum(["study", "list"]).optional(),
@@ -18,6 +19,6 @@ export const POST = withUser(async (req, _ctx, user) => {
   }).parse(await readJson(req));
   const today = resolveToday(body.date);
   const scope = await scopeOfBook(user.id, body.wordbookId);
-  const r = await rateWord(user.id, body.wordId, body.result, today, body.clientTs, body.source ?? "study", body.preview ?? false, scope);
+  const r = await rateWord(user.id, body.wordId, body.result, today, body.clientTs, body.source ?? "study", body.preview ?? false, scope, body);
   return ok({ ...r, labels: rateLabels(r.progress, await schedulerOptions(), today) });
 });

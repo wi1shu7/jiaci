@@ -1,4 +1,5 @@
 import { Prisma, type StudySource } from "@prisma/client";
+import { State } from "ts-fsrs";
 import { wordFreq, type WordFreq } from "./dict";
 import { wordCore, wordView, type WordView, type DictPart } from "./word-view";
 import { AI_CARD_SELECT, AI_RUN_SELECT, aiDetailSelect, aiProvidersWithData, aiRowOf, isFullAiRow, pickAi, type AiPreference, type WordAiRelations, AI_PROVIDERS, type AiProvider } from "./ai/providers";
@@ -7,6 +8,7 @@ import { prisma } from "./db";
 import { ApiError } from "./api";
 import { getConfig, getConfigInt } from "./config";
 import { applyRating, doneTodayIds, isDone, NEW_PROGRESS, rateLabels, type ProgressState, type RateResult, type SchedulerOptions } from "./scheduler";
+import { LEARNING_STEP_MINUTES, splitStudyQueue, type StudyQueueItem } from "./study-queue";
 import { deriveStatus, pieProgress, type WordStatus } from "./status";
 import { fromDate, toDate } from "./dates";
 import { getSettings } from "./settings";
@@ -24,9 +26,16 @@ export async function getCurrentWordbookId(userId: string): Promise<string | nul
   return c?.wordbookId ?? null;
 }
 
-export function toProgressState(p: { interval: number; stability: number | null; difficulty: number | null; reps: number; lapses: number; status: ProgressState["status"]; dueDate: Date | null; lastReview: Date | null } | null): ProgressState {
+export function toProgressState(p: (Omit<ProgressState, "fsrsState" | "dueAt" | "dueDate" | "lastReview"> & { fsrsState: number; dueAt: Date | null; dueDate: Date | null; lastReview: Date | null }) | null): ProgressState {
   if (!p) return { ...NEW_PROGRESS };
-  return { interval: p.interval, stability: p.stability, difficulty: p.difficulty, reps: p.reps, lapses: p.lapses, status: p.status, dueDate: fromDate(p.dueDate), lastReview: fromDate(p.lastReview) };
+  return { interval: p.interval, stability: p.stability, difficulty: p.difficulty, reps: p.reps, lapses: p.lapses, status: p.status, fsrsState: p.fsrsState as State, dueAt: p.dueAt?.toISOString() ?? null, dueDate: fromDate(p.dueDate), lastReview: fromDate(p.lastReview) };
+}
+
+function progressFields(progress: ProgressState) {
+  return {
+    ...progress, dueAt: progress.dueAt ? new Date(progress.dueAt) : null,
+    dueDate: toDate(progress.dueDate), lastReview: toDate(progress.lastReview),
+  };
 }
 
 /** FSRS 参数（需求 3.2.4）：目标保持率、已掌握阈值、个性化权重，都在 system_config 里 */
@@ -197,7 +206,7 @@ export type RateOutcome = Awaited<ReturnType<typeof rateWord>>;
  * 单词列表的「加进度」靠它先拿到结果本地显示，撤销期过后再用同一个 clientTs 真正提交。
  * scope 是进度作用域（见 scopeOfBook）：读写哪一套进度、守卫看哪一套记录，都只在这个作用域里
  */
-export async function rateWord(userId: string, wordId: string, result: RateResult, today: string, clientTs?: string, source: StudySource = "study", preview = false, scope: Scope = GLOBAL_SCOPE) {
+export async function rateWord(userId: string, wordId: string, result: RateResult, today: string, clientTs?: string, source: StudySource = "study", preview = false, scope: Scope = GLOBAL_SCOPE, { ratedAt, cardDueAt }: { ratedAt?: number; cardDueAt?: string } = {}) {
   const opts = await schedulerOptions();
   // 「今天」一律按客户端本地日期存的 study_date 算，不用服务器 UTC 时刻（审计 F035）
   const studyDate = toDate(today)!;
@@ -208,8 +217,10 @@ export async function rateWord(userId: string, wordId: string, result: RateResul
       if (clientTs) {
         const dup = await tx.studyLog.findUnique({ where: { userId_clientTs: { userId, clientTs } } });
         if (dup) {
-          const p = await tx.userWordProgress.findUnique({ where: { userId_wordId_scope: { userId, wordId, scope: dup.scope } } });
-          return { progress: toProgressState(p), nextInterval: dup.nextInterval, requeueToday: dup.nextInterval === 0 && (dup.result === "fuzzy" || dup.result === "reset"), duplicate: true, skipped: null as string | null };
+          if (dup.wordId !== wordId) throw new ApiError(409, "打分标识已用于其他词条", "rating_conflict");
+          const progress = toProgressState(await tx.userWordProgress.findUnique({ where: { userId_wordId_scope: { userId, wordId: dup.wordId, scope: dup.scope } } }));
+          const finished = progress.status === "removed" || progress.status === "mastered";
+          return { progress, nextInterval: finished ? -1 : progress.interval, requeueToday: progress.dueAt !== null, duplicate: true, skipped: finished ? progress.status : null };
         }
       }
       const existing = await tx.userWordProgress.findUnique({ where: { userId_wordId_scope: { userId, wordId, scope } } });
@@ -232,10 +243,16 @@ export async function rateWord(userId: string, wordId: string, result: RateResul
         if (!preview) await tx.studyLog.create({ data: { userId, wordId, result, nextInterval: existing?.interval ?? 0, clientTs: clientTs ?? null, studyDate, source, scope } });
         return { progress: toProgressState(existing), nextInterval: existing?.interval ?? 0, requeueToday: false, duplicate: false, skipped: "stale" as string | null };
       }
-      const outcome = applyRating(toProgressState(existing), result, today, opts);
+      const now = new Date();
+      if (source === "study" && (result === "know" || result === "fuzzy") && existing?.dueAt && existing.dueAt > now && existing.dueAt.toISOString() !== cardDueAt) {
+        return { progress: toProgressState(existing), nextInterval: 0, requeueToday: true, duplicate: false, skipped: "pending" };
+      }
+      const ratingTime = source === "study" && ratedAt !== undefined ? new Date(Math.min(ratedAt, now.getTime())) : now;
+      const outcome = applyRating(toProgressState(existing), result, today, opts, ratingTime);
       const p = outcome.progress;
+      if (result === "reset" && source === "study") p.dueAt = new Date(ratingTime.getTime() + LEARNING_STEP_MINUTES * 60_000).toISOString();
       if (!preview) {
-        const fields = { interval: p.interval, stability: p.stability, difficulty: p.difficulty, reps: p.reps, lapses: p.lapses, status: p.status, dueDate: toDate(p.dueDate), lastReview: toDate(p.lastReview) };
+        const fields = progressFields(p);
         await tx.userWordProgress.upsert({ where: { userId_wordId_scope: { userId, wordId, scope } }, create: { userId, wordId, scope, ...fields }, update: fields });
         await tx.studyLog.create({ data: { userId, wordId, result, nextInterval: outcome.nextInterval, clientTs: clientTs ?? null, studyDate, source, scope } });
       }
@@ -307,7 +324,7 @@ export async function rateWordsBatch(userId: string, wordIds: string[], result: 
         const outcome = applyRating(cur, result, today, opts);
         const p = outcome.progress;
         if (!preview) {
-          const fields = { interval: p.interval, stability: p.stability, difficulty: p.difficulty, reps: p.reps, lapses: p.lapses, status: p.status, dueDate: toDate(p.dueDate), lastReview: toDate(p.lastReview) };
+          const fields = progressFields(p);
           await tx.userWordProgress.upsert({ where: { userId_wordId_scope: { userId, wordId, scope } }, create: { userId, wordId, scope, ...fields }, update: fields });
         }
         logs.push({ userId, wordId, result, nextInterval: outcome.nextInterval, studyDate, source: "list", scope });
@@ -327,7 +344,7 @@ export async function rateWordsBatch(userId: string, wordIds: string[], result: 
 /** ---------- 今日队列（3.2.1 / 3.2.3 / 开发计划 6） ---------- */
 
 /** 今日队列里的一项：卡片正面只要音标与例句英文，答案页另取详情 */
-export type QueueItem = { wordId: string; spelling: string; display: string | null; kind: "review" | "new"; phonetic: { us: string; uk: string } | null; examples: string[] };
+export type QueueItem = StudyQueueItem & { wordId: string; spelling: string; display: string | null; phonetic: { us: string; uk: string } | null; examples: string[] };
 /** 队列只取音标与例句两列（AI_CARD_SELECT），所以这里的 AI 行是窄类型 */
 type AiCardRow = { phoneticUs: string | null; phoneticUk: string | null; examples: Prisma.JsonValue };
 const cardOf = (w: DictPart & WordAiRelations<AiCardRow>, pref: AiPreference) => { const p = pickAi(w, pref); const v = wordView(w, p?.row, p?.provider ?? null); return { phonetic: v.phonetic, examples: v.examples.map((e) => e.en) }; };
@@ -338,7 +355,7 @@ function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-/** 队列里带例句的卡片数：与学习页的详情预取深度（idx..idx+3）对齐 */
+/** 队列里带例句的卡片数，与学习页的详情预取深度对齐 */
 const QUEUE_EXAMPLES = 4;
 
 /**
@@ -359,19 +376,28 @@ export async function buildTodayQueue(userId: string, today: string, opts: { ext
   // 按每个词今天最后一条记录算，与 rateWord 的守卫一致——认识之后又「重新记」的词按新词重新进队列
   const doneToday = doneTodayIds(todayLogs);
   // 首页的「今日已完成」只算学习卡上完成的：在单词列表里批量标已掌握不是「学过」（审计 F024）
-  const doneStudying = new Set(todayLogs.filter((l) => l.source === "study" && (l.result === "know" || l.result === "master")).map((l) => l.wordId));
+  const doneStudying = doneTodayIds(todayLogs.filter((log) => log.source === "study"));
+  for (const wordId of doneStudying) if (!doneToday.has(wordId)) doneStudying.delete(wordId);
   // 只有学习卡上的打分才算「今天学过」：列表页的已掌握 / 移出 / 重新记也写 study_log，
   // 一起算进去的话批量整理词库会把当天的新词配额吃光（审计 F024）
   const startedToday = new Set(todayLogs.filter((l) => l.source === "study" && (l.result === "know" || l.result === "fuzzy")).map((l) => l.wordId));
 
-  // 复习：到期 learning 词，按 due 升序，受每日复习上限
-  const dueWhere = Prisma.validator<Prisma.UserWordProgressWhereInput>()({ userId, scope, status: "learning", dueDate: { lte: toDate(today)! }, wordId: { notIn: Array.from(doneToday) } });
-  const reviewsRaw = opts.statsOnly ? [] : await prisma.userWordProgress.findMany({
-    where: dueWhere,
-    orderBy: { dueDate: "asc" }, take: settings.reviewLimit, include: { word: { include: AI_CARD_SELECT } },
+  // 到期的长期复习遵守每日上限；短期学习步单独计入队列，不占用该上限。
+  const dueReviewWhere = Prisma.validator<Prisma.UserWordProgressWhereInput>()({
+    userId, scope, status: "learning", fsrsState: State.Review, dueDate: { lte: studyDate }, wordId: { notIn: [...doneToday] },
   });
-  const reviewCount = opts.statsOnly ? Math.min(settings.reviewLimit, await prisma.userWordProgress.count({ where: dueWhere })) : reviewsRaw.length;
-  const reviewDeferred = await prisma.userWordProgress.count({ where: { userId, scope, status: "learning", dueDate: { lte: toDate(today)! } } }) - reviewCount;
+  const relearnWhere = Prisma.validator<Prisma.UserWordProgressWhereInput>()({
+    userId, scope, status: { in: ["new", "learning"] }, dueAt: { not: null },
+  });
+  const [dueReviewTotal, reviewsRaw, relearnCountOrRows] = await Promise.all([
+    prisma.userWordProgress.count({ where: dueReviewWhere }),
+    opts.statsOnly ? [] : prisma.userWordProgress.findMany({ where: dueReviewWhere, orderBy: { dueDate: "asc" }, take: settings.reviewLimit, include: { word: { include: AI_CARD_SELECT } } }),
+    opts.statsOnly ? prisma.userWordProgress.count({ where: relearnWhere }) : prisma.userWordProgress.findMany({ where: relearnWhere, orderBy: { dueAt: "asc" }, include: { word: { include: AI_CARD_SELECT } } }),
+  ]);
+  const relearnRaw = Array.isArray(relearnCountOrRows) ? relearnCountOrRows : [];
+  const relearnCount = Array.isArray(relearnCountOrRows) ? relearnCountOrRows.length : relearnCountOrRows;
+  const reviewCount = (opts.statsOnly ? Math.min(settings.reviewLimit, dueReviewTotal) : reviewsRaw.length) + relearnCount;
+  const reviewDeferred = Math.max(0, dueReviewTotal - settings.reviewLimit);
 
   // 新词：当前词库中无 progress 的词（或 status=new，如重新记后），按 sort_order / 随机，补足配额
   let newsRaw: Array<{ wordId: string; word: DictPart & WordAiRelations<AiCardRow> & { spelling: string; display: string | null } }> = [];
@@ -382,12 +408,14 @@ export async function buildTodayQueue(userId: string, today: string, opts: { ext
     // 今天已开始的新词占用配额（extra 模式忽略）
     // 今天首次学习的词（今天有记录、今天之前没有记录）占用新词配额
     let startedNewToday = 0;
-    if (!opts.extra && startedToday.size) {
-      const earlier = await prisma.studyLog.findMany({ where: { userId, scope, wordId: { in: Array.from(startedToday) }, source: "study", result: { in: ["know", "fuzzy"] }, studyDate: { lt: studyDate } }, distinct: ["wordId"], select: { wordId: true } });
+    if (opts.extra === undefined && startedToday.size) {
+      const earlier = await prisma.studyLog.findMany({ where: { userId, scope, wordId: { in: Array.from(startedToday) }, result: { in: ["know", "fuzzy"] }, studyDate: { lt: studyDate } }, distinct: ["wordId"], select: { wordId: true } });
       startedNewToday = startedToday.size - earlier.length;
     }
     const need = Math.max(0, quota - startedNewToday);
-    const memberWhere = Prisma.validator<Prisma.WordbookWordWhereInput>()({ wordbookId: bookId, word: { progress: { none: { userId, scope, status: { in: ["learning", "mastered", "removed"] } } } } });
+    const memberWhere = Prisma.validator<Prisma.WordbookWordWhereInput>()({
+      wordbookId: bookId, word: { progress: { none: { userId, scope, OR: [{ status: { in: ["learning", "mastered", "removed"] } }, { dueAt: { not: null } }] } } },
+    });
     let pickedIds: string[];
     if (opts.statsOnly) {
       // 只要条数：候选数就是 newRemaining——今天学过的词状态已经变成 learning / mastered，
@@ -416,16 +444,20 @@ export async function buildTodayQueue(userId: string, today: string, opts: { ext
   }
 
   let items: QueueItem[] = [
-    ...reviewsRaw.map((r) => ({ wordId: r.wordId, spelling: r.word.spelling, display: r.word.display, kind: "review" as const, ...cardOf(r.word, settings.aiProvider) })),
-    ...newsRaw.map((n) => ({ wordId: n.wordId, spelling: n.word.spelling, display: n.word.display, kind: "new" as const, ...cardOf(n.word, settings.aiProvider) })),
+    ...reviewsRaw.map((r) => ({ wordId: r.wordId, spelling: r.word.spelling, display: r.word.display, kind: "review" as const, dueAt: null, ...cardOf(r.word, settings.aiProvider) })),
+    ...newsRaw.map((n) => ({ wordId: n.wordId, spelling: n.word.spelling, display: n.word.display, kind: "new" as const, dueAt: null, ...cardOf(n.word, settings.aiProvider) })),
   ];
   if (settings.order === "mixed") items = shuffle(items);
+  for (const row of relearnRaw) {
+    items.push({ wordId: row.wordId, spelling: row.word.spelling, display: row.word.display, kind: "relearn", dueAt: row.dueAt?.toISOString() ?? null, ...cardOf(row.word, settings.aiProvider) });
+  }
+  const { ready, pending } = splitStudyQueue(items, Date.now());
+  items = [...ready, ...pending];
   // 例句只发前几条卡片的：整条队列都带例句时，200 词的队列有一多半字节是例句（实测 78 KB 里 44 KB），
   // 而例句只有当前这张卡的正面用得到。学习页本来就会预取后面几个词的详情，翻到时例句已经在手上
   // （拿不到详情的极端情况下正面暂时不显示例句区，答案页不受影响）（性能优化 P1-5）
   for (let i = QUEUE_EXAMPLES; i < items.length; i++) items[i].examples = [];
 
-  // 已在今天进入过队列但打了「模糊(今日)」的词也会再次出现：由客户端重排，这里不重复计算
   return {
     items,
     stats: { newCount, reviewCount, doneToday: doneStudying.size, reviewDeferred, newRemaining, startedToday: startedToday.size },
@@ -477,7 +509,9 @@ export async function buildRunList(userId: string, today: string, limit?: number
   const scope = await scopeOfBook(userId, q.bookId);
   const todayLogs = await prisma.studyLog.findMany({ where: { userId, scope, studyDate: toDate(today)!, source: "study" }, orderBy: { studiedAt: "asc" }, select: { wordId: true, result: true } });
   const kinds = new Map<string, RunWord["kind"]>();
-  for (const it of q.items) kinds.set(it.wordId, it.kind);
+  for (const it of splitStudyQueue(q.items, Date.now()).ready) {
+    kinds.set(it.wordId, it.kind === "new" ? "new" : "review");
+  }
   for (const id of doneTodayIds(todayLogs)) if (!kinds.has(id)) kinds.set(id, "done");
   const ids = Array.from(kinds.keys());
   const picked = ids.slice(0, max);
@@ -826,7 +860,7 @@ export async function exportUserData(userId: string) {
     user: { ...user, settings },
     currentWordbook: currentBook?.name ?? null,
     wordbooks: wordbooks.map((b) => ({ name: b.name, type: b.type, createdAt: b.createdAt, words: b.words.map((w) => w.word.spelling) })),
-    progress: progress.map((p) => ({ word: p.word.spelling, wordbook: scopeName(p.scope), interval: p.interval, stability: p.stability, difficulty: p.difficulty, reps: p.reps, lapses: p.lapses, status: p.status, dueDate: fromDate(p.dueDate), lastReview: fromDate(p.lastReview) })),
+    progress: progress.map((p) => ({ word: p.word.spelling, wordbook: scopeName(p.scope), ...toProgressState(p) })),
     notes: notes.map((n) => ({ word: n.word.spelling, note: n.note, updatedAt: n.updatedAt })),
     studyLog: logs.map((l) => ({ word: l.word.spelling, wordbook: scopeName(l.scope), result: l.result, nextInterval: l.nextInterval, studyDate: fromDate(l.studyDate), studiedAt: l.studiedAt })),
     ownProgress: bookSettings.filter((s) => s.ownProgress).map((s) => s.wordbook.name),

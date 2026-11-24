@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { State } from "ts-fsrs";
 import { addDays, applyRating, doneTodayIds, NEW_PROGRESS, rateLabels, retrievability, DEFAULT_MASTER_INTERVAL, DEFAULT_RETENTION, type ProgressState } from "../src/lib/scheduler";
 
 const T = "2026-09-05";
@@ -14,10 +15,11 @@ function knowUntilMastered(o = {}, max = 12) {
 }
 
 describe("FSRS 调度", () => {
-  it("新词 认识 → 学习中，安排在 1 天以上，记录稳定性与难度", () => {
+  it("新词认识后直接安排长期复习", () => {
     const r = applyRating(NEW_PROGRESS, "know", T);
     expect(r.progress.status).toBe("learning");
-    // interval 由 Math.max(1, …) 兜底，≥ 1 恒真：连同 stability 一起断言才有意义（审计 F159）
+    expect(r.progress).toMatchObject({ fsrsState: State.Review, dueAt: null });
+    expect(r.requeueToday).toBe(false);
     expect(r.progress.interval).toBeGreaterThanOrEqual(1);
     expect(r.progress.interval).toBeLessThanOrEqual(30);
     expect(r.progress.dueDate).toBe(addDays(T, r.progress.interval));
@@ -45,27 +47,25 @@ describe("FSRS 调度", () => {
     const loose = applyRating(p, "know", p.dueDate!, { retention: 0.8 }).progress.interval;
     expect(loose).toBeGreaterThan(on);
   });
-  it("模糊：新词或间隔 ≤ 1 → 今日再出现", () => {
-    const r = applyRating(NEW_PROGRESS, "fuzzy", T);
+  it("模糊的新词稍后重学，并能在当天结束学习步", () => {
+    const now = new Date("2026-09-05T12:00:00.000Z");
+    const r = applyRating(NEW_PROGRESS, "fuzzy", T, {}, now);
     expect(r.requeueToday).toBe(true);
     expect(r.nextInterval).toBe(0);
-    // 当日重排时 interval 与 dueDate 一致：都表示「今天」（审计 F029）
-    expect(r.progress).toMatchObject({ interval: 0, status: "learning", dueDate: T, reps: 1 });
-    // 同日再打认识：从今日算起安排
-    const k = applyRating(r.progress, "know", T);
-    expect(k.progress.interval).toBeGreaterThanOrEqual(1);
-    expect(k.progress.dueDate).toBe(addDays(T, k.progress.interval));
-  });
-  it("同日「模糊 → 认识」按学习步毕业：安排 1 天后，到期保持率回到目标值（审计 F030）", () => {
-    const fuzzy = applyRating(NEW_PROGRESS, "fuzzy", T).progress;
-    const k = applyRating(fuzzy, "know", T);
-    // 改之前：稳定性停在 0.212 不动，间隔却被 Good ≥ Hard + 1 的阶梯抬到 3 天，到期只剩 66%
-    expect(k.progress.interval).toBe(1);
-    expect(k.progress.stability!).toBeGreaterThan(fuzzy.stability!);
+    expect(r.progress).toMatchObject({ interval: 0, status: "learning", fsrsState: State.Learning, dueDate: T, reps: 1 });
+    expect(Date.parse(r.progress.dueAt!)).toBe(now.getTime() + 60_000);
+    const k = applyRating(r.progress, "know", T, {}, new Date(r.progress.dueAt!));
+    expect(k.requeueToday).toBe(false);
+    expect(k.progress).toMatchObject({ fsrsState: State.Review, interval: 1, dueAt: null, dueDate: addDays(T, 1) });
+    expect(k.progress.stability!).toBeGreaterThan(r.progress.stability!);
     expect(retrievability(k.progress, {}, k.progress.dueDate!)!).toBeGreaterThanOrEqual(DEFAULT_RETENTION);
-    // 难度不因为毕业而被抹掉：先模糊过的词仍然比一上来就认识的难
-    expect(k.progress.difficulty!).toBeGreaterThan(applyRating(NEW_PROGRESS, "know", T).progress.difficulty!);
-    expect(rateLabels(fuzzy, {}, T).know).toBe("1 天后");
+  });
+  it("短期学习由到期时间驱动；连续忘记重新安排下次步骤", () => {
+    const now = new Date("2026-09-05T12:00:00.000Z");
+    const first = applyRating(NEW_PROGRESS, "fuzzy", T, {}, now).progress;
+    const second = applyRating(first, "fuzzy", T, {}, new Date(first.dueAt!)).progress;
+    expect(Date.parse(second.dueAt!)).toBe(Date.parse(first.dueAt!) + 60_000);
+    expect(second.fsrsState).toBe(State.Learning);
   });
   it("学习步毕业之后每次到期的预测保持率都不低于目标值", () => {
     let p = applyRating(applyRating(NEW_PROGRESS, "fuzzy", T).progress, "know", T).progress;
@@ -78,17 +78,10 @@ describe("FSRS 调度", () => {
     // 间隔取整会让保持率在目标值上下各差一点，允许 1 个百分点
     for (const r of seen) expect(r).toBeGreaterThan(DEFAULT_RETENTION - 0.01);
   });
-  it("学习步毕业只认「今天模糊过、被排到队尾」这一种：认识后同日再认识、重新记后认识都不受影响", () => {
-    const know = applyRating(NEW_PROGRESS, "know", T).progress;
-    const twice = applyRating(know, "know", T).progress;
-    expect(twice.interval).toBe(know.interval);
-    expect(twice.stability).toBeCloseTo(know.stability!, 6);
-    // 模糊后隔天才认识：走正常的复习公式，不做毕业处理
+  it("隔天完成短期重学时，FSRS 按实际跨天间隔计算", () => {
     const nextDay = applyRating(applyRating(NEW_PROGRESS, "fuzzy", T).progress, "know", addDays(T, 1)).progress;
+    expect(nextDay.fsrsState).toBe(State.Review);
     expect(nextDay.interval).toBeGreaterThan(1);
-    // 重新记把卡清成新卡，之后的认识等同新词（上面「已掌握 / 重新记 / 移出」一节已断言相等）
-    const reset = applyRating(know, "reset", know.dueDate!).progress;
-    expect(applyRating(reset, "know", know.dueDate!).progress.interval).toBe(know.interval);
   });
   it("模糊：长间隔的词 → 遗忘次数 +1，稳定性下降，比认识安排得近", () => {
     const mature = knowUntilMastered({ masterInterval: 1000 }, 4).p;   // 打 4 次认识
@@ -96,11 +89,15 @@ describe("FSRS 调度", () => {
     const day = mature.dueDate!;
     const f = applyRating(mature, "fuzzy", day);
     const k = applyRating(mature, "know", day);
-    expect(f.requeueToday).toBe(false);
+    expect(f.requeueToday).toBe(true);
     expect(f.progress.lapses).toBe(mature.lapses + 1);
     expect(f.progress.stability!).toBeLessThan(mature.stability!);
     expect(f.progress.interval).toBeLessThan(k.progress.interval);
-    expect(f.progress.dueDate).toBe(addDays(day, f.progress.interval));
+    expect(f.progress.fsrsState).toBe(State.Relearning);
+    expect(Date.parse(f.progress.dueAt!) - Date.parse(`${day}T00:00:00.000Z`)).toBe(10 * 60_000);
+    const relearned = applyRating(f.progress, "know", day, {}, new Date(f.progress.dueAt!));
+    expect(relearned.progress).toMatchObject({ fsrsState: State.Review, dueAt: null });
+    expect(relearned.nextInterval).toBeGreaterThan(0);
   });
   it("迟到的复习按实际间隔给信用：晚 20 天再认识，下次间隔更长", () => {
     const p = knowUntilMastered({ masterInterval: 1000 }, 3).p;
@@ -109,7 +106,7 @@ describe("FSRS 调度", () => {
     expect(late).toBeGreaterThan(onTime);
   });
   it("已掌握 / 重新记 / 移出", () => {
-    const p: ProgressState = { ...NEW_PROGRESS, interval: 7, stability: 7, difficulty: 5, reps: 4, lapses: 1, status: "learning", dueDate: "2026-09-12", lastReview: T };
+    const p: ProgressState = { ...NEW_PROGRESS, interval: 7, stability: 7, difficulty: 5, reps: 4, lapses: 1, status: "learning", fsrsState: State.Review, dueDate: "2026-09-12", lastReview: T };
     expect(applyRating(p, "master", T).progress).toMatchObject({ status: "mastered", dueDate: null, interval: DEFAULT_MASTER_INTERVAL, stability: DEFAULT_MASTER_INTERVAL });
     const reset = applyRating(p, "reset", T);
     expect(reset.progress).toMatchObject({ status: "new", interval: 0, stability: null, difficulty: null, reps: 4, lapses: 1, dueDate: T });
@@ -137,11 +134,11 @@ describe("FSRS 调度", () => {
   });
   it("按钮文案与保持率", () => {
     const l = rateLabels(NEW_PROGRESS, {}, T);
-    expect(l.fuzzy).toBe("今日再见");
+    expect(l.fuzzy).toBe("1 分钟后");
     expect(l.know).toMatch(/^\d+ 天后$/);
     const mature = knowUntilMastered({ masterInterval: 1000 }, 5).p;
     expect(rateLabels(mature, {}, mature.dueDate!).know).toBe("已掌握");
-    expect(rateLabels(mature, {}, mature.dueDate!).fuzzy).toMatch(/^\d+ 天后$/);
+    expect(rateLabels(mature, {}, mature.dueDate!).fuzzy).toBe("10 分钟后");
     expect(retrievability(NEW_PROGRESS)).toBeNull();
     const r = retrievability(mature, {}, mature.dueDate!);
     expect(r).toBeGreaterThan(0.8); expect(r).toBeLessThanOrEqual(1);

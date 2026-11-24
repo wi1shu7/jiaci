@@ -86,9 +86,9 @@ export default function WordScreen({ mode, spelling, initial, initialError = "" 
     if (!detail || busy) return;
     setBusy(true);
     try {
-      const res = await api<{ nextInterval: number }>("/api/study/rate", { method: "POST", json: { wordId: detail.id, result: r, date: localToday(), clientTs: `${detail.id}-${Date.now()}`, wordbookId: detail.bookId ?? undefined } });
+      const res = await api<{ nextInterval: number; skipped?: string | null }>("/api/study/rate", { method: "POST", json: { wordId: detail.id, result: r, date: localToday(), clientTs: `${detail.id}-${Date.now()}`, wordbookId: detail.bookId ?? undefined } });
       dirty.current = true;
-      toast(r === "master" ? "已标记为已掌握，不再进入学习" : r === "reset" ? "已重新记：保留学习记录，按新词重新开始" : res.nextInterval === 0 ? "今日学习时再次出现" : `下次复习：${res.nextInterval} 天后`);
+      toast(res.skipped === "pending" ? "该词已在重学队列中" : r === "master" ? "已标记为已掌握，不再进入学习" : r === "reset" ? "已重新记：保留学习记录，按新词重新开始" : res.nextInterval === 0 ? "已加入短期重学" : `下次复习：${res.nextInterval} 天后`);
       await load();
     } catch (e) { toast((e as Error).message); } finally { setBusy(false); }
   }

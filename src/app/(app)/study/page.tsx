@@ -8,17 +8,17 @@ import PomodoroButton from "@/components/Pomodoro";
 import { IconSpeaker, IconTap, IconX } from "@/components/Icons";
 import { useToast } from "@/components/Toast";
 import { api, localToday } from "@/lib/client/api";
-import { flushPendingRates, isRetriableRateError, stashPendingRate } from "@/lib/client/pending-rates";
+import { flushPendingRates, isRetriableRateError, readPendingRates, stashPendingRate } from "@/lib/client/pending-rates";
 import { useMe } from "@/lib/client/useMe";
 import { onWordChanged } from "@/lib/client/word-events";
 import { useUser } from "@/components/UserContext";
 import { preloadAudio, speakSequence, speakSentence, speakWord, stopSpeaking, voiceKeyOf } from "@/lib/client/speech";
-import type { WordDetail as Detail } from "@/lib/study";
+import { LEARNING_STEP_MINUTES, RELEARNING_STEP_MINUTES, splitStudyQueue } from "@/lib/study-queue";
+import type { QueueItem as Item, WordDetail as Detail } from "@/lib/study";
 import type { RateResult } from "@/lib/scheduler";
 import "./study.css";
 
-type Item = { wordId: string; spelling: string; display?: string | null; kind: "review" | "new"; phonetic: { us: string; uk: string } | null; examples: string[] };
-type TodayResp = { items: Item[]; stats: { newCount: number; reviewCount: number }; hasBook: boolean; bookId: string | null };
+type TodayResp = { items: Item[]; hasBook: boolean; bookId: string | null };
 const RESULT_TAG: Record<string, [string, string]> = { know: ["tag-result-know", "认识"], fuzzy: ["tag-review", "模糊"], master: ["tag-result-master", "已掌握"], reset: ["tag-result-reset", "重新记"], remove: ["tag-none", "移出"] };
 
 /** 学习卡片页（需求 3.2.2）：正面 → 点击显示答案（单词详情）→ 底部打分 → 下一个 */
@@ -29,22 +29,20 @@ function Study() {
   const { settings, loading: meLoading } = useMe();
   const userId = useUser()?.id;
   const { toast } = useToast();
-  const [queue, setQueue] = useState<Item[]>([]);
-  const [idx, setIdx] = useState(0);
+  const [{ ready: queue, pending: pendingRelearn }, setQueue] = useState<{ ready: Item[]; pending: Item[] }>({ ready: [], pending: [] });
   const [done, setDone] = useState(0);
   const [total, setTotal] = useState(0);
   const [screen, setScreen] = useState<"front" | "answer">("front");
   const [detail, setDetail] = useState<Detail | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "empty" | "nobook" | "error">("loading");
   const [detailErr, setDetailErr] = useState("");
-  const [replayed, setReplayed] = useState(false);
   const [frontHistory, setFrontHistory] = useState<Detail["history"]>([]);
   const [frontExamples, setFrontExamples] = useState<string[]>([]);
   const alive = useRef(true);
   const [busy, setBusy] = useState(false);
   const cache = useRef(new Map<string, Detail>());
   const counts = useRef({ know: 0, all: 0, newN: 0, reviewN: 0 });
-  const cur = queue[idx];
+  const cur = queue[0];
   const curRef = useRef(cur);
   curRef.current = cur;
 
@@ -58,25 +56,26 @@ function Study() {
     return d;
   }, []);
 
-  // 离线暂存的打分（lib/client/pending-rates，与跑步模式共用）：恢复后按存入顺序逐条补交，补完再拉今日队列（审计 F180 / F037）
   useEffect(() => {
-    if (!userId) { setReplayed(true); return; }
-    let on = true;
-    flushPendingRates(userId).finally(() => { if (on) setReplayed(true); });
-    return () => { on = false; };
-  }, [userId]);
-
-  useEffect(() => {
-    // 等补交落库再取队列，否则这些词会被当成没学过再排一次（审计 F037）
-    if (!replayed) return;
-    api<TodayResp>(`${extra ? "/api/study/extra" : "/api/study/today"}?date=${localToday()}`).then((r) => {
+    let active = true;
+    setStatus("loading");
+    const load = async () => {
+      if (userId) await flushPendingRates(userId);
+      if (!active) return;
+      const r = await api<TodayResp>(`${extra ? "/api/study/extra" : "/api/study/today"}?date=${localToday()}`);
+      if (!active) return;
       if (!r.hasBook) { setStatus("nobook"); return; }
       bookRef.current = r.bookId;
       if (!r.items.length) { setStatus("empty"); return; }
-      setQueue(r.items); setTotal(r.items.length); setStatus("ready");
-      counts.current.newN = r.items.filter((i) => i.kind === "new").length; counts.current.reviewN = r.items.length - counts.current.newN;
-    }).catch((e) => { setStatus("error"); toast((e as Error).message); });
-  }, [extra, toast, replayed]);
+      cache.current.clear();
+      setQueue(splitStudyQueue(r.items, Date.now(), { learnAhead: true })); setTotal(r.items.length); setDone(0);
+      setScreen("front"); setDetail(null); setDetailErr(""); setStatus("ready");
+      const newN = r.items.filter((item) => item.kind === "new").length;
+      counts.current = { know: 0, all: 0, newN, reviewN: r.items.length - newN };
+    };
+    void load().catch((e) => { if (active) { setStatus("error"); toast((e as Error).message); } });
+    return () => { active = false; };
+  }, [extra, toast, userId]);
 
   // 在详情浮层里改了某个词的状态：缓存的详情已经过时，丢掉，下次要用时重新取
   useEffect(() => onWordChanged((s) => { cache.current.delete(s); }), []);
@@ -102,9 +101,8 @@ function Study() {
 
   // 预取下一批详情，切换无延迟（需求 4.2）
   useEffect(() => {
-    if (!queue.length) return;
-    queue.slice(idx, idx + 4).forEach((it) => { fetchDetail(it.spelling).catch(() => {}); });
-  }, [queue, idx, fetchDetail]);
+    queue.slice(0, 4).forEach((it) => { fetchDetail(it.spelling).catch(() => {}); });
+  }, [queue, fetchDetail]);
 
   // 正面出现时自动发音
   useEffect(() => {
@@ -115,10 +113,10 @@ function Study() {
   // 正面出现时预取本词例句与下一个词的单词音频，显示答案后自动朗读不用等
   useEffect(() => {
     if (screen !== "front" || !cur || meLoading) return;
-    const nextItem = queue[idx + 1];
+    const nextItem = queue[1];
     preloadAudio(nextItem ? [nextItem.spelling] : [], frontExamples, voiceKeyOf(settings.accent, settings.voice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cur?.wordId, screen, meLoading, frontExamples]);
+  }, [cur?.wordId, screen, meLoading, frontExamples, queue]);
 
   const showAnswer = useCallback(async () => {
     if (screen !== "front" || !cur) return;
@@ -136,49 +134,72 @@ function Study() {
     }
   }, [screen, cur, fetchDetail, settings]);
 
-  const next = useCallback((requeue: boolean, item: Item, r: RateResult) => {
-    const q = queue.slice();
-    if (requeue) q.push(r === "reset" ? { ...item, kind: "new" } : item);
+  const next = useCallback((requeue: boolean, item: Item, r: RateResult, dueAt: string | null) => {
+    const remaining = [...queue.slice(1), ...pendingRelearn];
+    if (requeue) {
+      const kind = dueAt ? "relearn" : r === "reset" ? "new" : item.kind;
+      remaining.push({ ...item, kind, dueAt });
+    }
+    const staged = splitStudyQueue(remaining, Date.now(), { learnAhead: true });
     const newDone = requeue ? done : done + 1;
-    stopSpeaking();
-    setQueue(q); setDone(newDone); setDetail(null); setDetailErr(""); setScreen("front");
     if (!alive.current) return;
-    if (newDone >= total || idx + 1 >= q.length) {
+    stopSpeaking();
+    setQueue(staged); setDone(newDone); setDetail(null); setDetailErr(""); setScreen("front");
+    if (!remaining.length) {
       const rate = counts.current.all ? Math.round((counts.current.know / counts.current.all) * 100) + "%" : "—";
       router.replace(`/study/done?new=${counts.current.newN}&review=${counts.current.reviewN}&rate=${encodeURIComponent(rate)}${extra ? "&extra=1" : ""}`);
       return;
     }
-    setIdx(idx + 1); window.scrollTo(0, 0);
-  }, [queue, done, total, idx, router, extra]);
+    window.scrollTo(0, 0);
+  }, [queue, pendingRelearn, done, router, extra]);
 
   const rate = useCallback(async (r: RateResult) => {
     if (screen !== "answer" || !cur || busy) return;
     setBusy(true);
     // 带上词库：离线补交时当前词库可能已经换了，打分要落在这条队列所属的那本上
-    const body = { wordId: cur.wordId, result: r, date: localToday(), clientTs: `${cur.wordId}-${Date.now()}`, wordbookId: bookRef.current ?? undefined };
-    counts.current.all++; if (r === "know" || r === "master") counts.current.know++;
+    const ratedAt = Date.now();
+    const body = { wordId: cur.wordId, result: r, date: localToday(), clientTs: `${cur.wordId}-${ratedAt}`, wordbookId: bookRef.current ?? undefined, ratedAt, cardDueAt: cur.dueAt ?? undefined };
     let requeue = false;
+    let dueAt: string | null = null;
+    let counted = true;
     try {
-      const res = await api<{ nextInterval: number; requeueToday: boolean; skipped?: string | null }>("/api/study/rate", { method: "POST", json: body });
+      if (userId && readPendingRates(userId).length) {
+        await flushPendingRates(userId);
+        if (readPendingRates(userId).length) throw new Error("还有打分等待同步");
+      }
+      const res = await api<{ nextInterval: number; requeueToday: boolean; progress?: { dueAt?: string | null }; duplicate?: boolean; skipped?: string | null }>("/api/study/rate", { method: "POST", json: body });
       requeue = res.requeueToday;
+      dueAt = res.progress?.dueAt ?? null;
+      counted = !res.duplicate && !res.skipped;
       // 队列可能是别处操作前拉的：该词已被移出 / 标为已掌握时服务端不再改状态，这里只提示一句（审计 F176）
       toast(res.skipped === "stale" ? "这条打分比其它设备上的记录旧，已记入历史但不改变复习安排"
         : res.skipped === "removed" ? "该词已移出学习，本次打分未记录"
         : res.skipped === "mastered" ? "该词已是已掌握，本次打分未记录"
+        : res.skipped === "pending" ? "重学安排已更新"
         : r === "master" ? "已标记为已掌握，不再出现"
-        : r === "reset" ? "已重新记：按新词重新加入今天的学习"
-        : res.nextInterval === 0 ? "今日稍后再次出现"
+        : r === "reset" ? "已重新记，稍后重新学习"
+        : requeue ? "已加入短期重学"
         : res.nextInterval === -1 ? "间隔已达上限，自动转为已掌握"
         : `下次复习：${res.nextInterval} 天后`);
     } catch (e) {
       // 只有网络不可用 / 服务端 5xx 才暂存重试；4xx 是永久错误，暂存下来只会每次进学习页反复重放（审计 F042）
       const retriable = isRetriableRateError(e);
-      if (retriable && userId) stashPendingRate(userId, body);
-      requeue = r === "reset" || (r === "fuzzy" && (detail?.progress.interval ?? 0) <= 1);
-      toast(retriable ? "网络不可用，打分已暂存，恢复后自动同步" : `没有保存成功：${(e as Error).message}`);
+      if (!retriable || !userId) { toast(`没有保存成功：${(e as Error).message}`); return; }
+      stashPendingRate(userId, body);
+      requeue = r === "reset" || r === "fuzzy";
+      if (requeue) {
+        const fsrsState = detail?.progress.fsrsState ?? 0;
+        const minutes = r === "fuzzy" && fsrsState >= 2 ? RELEARNING_STEP_MINUTES : LEARNING_STEP_MINUTES;
+        dueAt = new Date(ratedAt + minutes * 60_000).toISOString();
+      }
+      toast("网络不可用，打分已暂存，恢复后自动同步");
     } finally { setBusy(false); }
+    if (counted) {
+      counts.current.all++;
+      if (r === "know" || r === "master") counts.current.know++;
+    }
     cache.current.delete(cur.spelling);
-    next(requeue, cur, r);
+    next(requeue, cur, r, dueAt);
   }, [screen, cur, busy, toast, next, detail, userId]);
 
   useEffect(() => {
@@ -225,7 +246,7 @@ function FrontCard({ item, accent, voice, onReveal, history, examples }: { item:
   return (
     <div className="front" onClick={onReveal}>
       <div className="front-top">
-        <span className={`kind tag ${item.kind === "review" ? "tag-review" : "tag-new"}`}>{item.kind === "review" ? "复习" : "新词"}</span>
+        <span className={`kind tag ${item.kind === "new" ? "tag-new" : "tag-review"}`}>{item.kind === "new" ? "新词" : item.kind === "relearn" ? "重学" : "复习"}</span>
         <div className="spelling-lg">{item.display ?? item.spelling}</div>
         <div className="phonetic-row"><span>{item.phonetic ? (accent === "uk" ? item.phonetic.uk : item.phonetic.us) : "—"}</span><button className="btn btn-icon sm btn-soft" type="button" aria-label="发音" onClick={(e) => { e.stopPropagation(); speakWord(item.spelling, vk); }}><IconSpeaker /></button></div>
       </div>

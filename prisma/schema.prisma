@@ -497,12 +497,16 @@ model UserWordProgress {
   userId     String         @map("user_id")
   /// 单词 ID
   wordId     String         @map("word_id")
-  /// 当前安排的复习间隔（天，FSRS 的 scheduled_days）；0 表示新词
+  /// 当前安排的复习间隔（天）；0 表示新词或短期重学
   interval   Int            @default(0)
   /// FSRS 记忆稳定性（天）；新词为空
   stability  Float?
   /// FSRS 难度 1–10；新词为空
   difficulty Float?
+  /// FSRS 卡片阶段：0 新卡 / 1 学习中 / 2 复习 / 3 重学
+  fsrsState  Int            @default(0) @map("fsrs_state")
+  /// 短期重学的精确到期时间；长期复习按 due_date
+  dueAt      DateTime?      @map("due_at") @db.Timestamptz(3)
   /// 最近一次打分的日期，用于按实际间隔计算
   lastReview DateTime?      @map("last_review") @db.Date
   /// 下次复习日期；已掌握 / 已移出为空
@@ -539,7 +543,7 @@ model StudyLog {
   wordId       String      @map("word_id")
   /// 结果：know 认识 / fuzzy 模糊 / master 已掌握 / reset 重新记 / remove 移出
   result       StudyResult
-  /// 打分后的下次间隔（天）：0 = 今日再出现，-1 = 不再出现
+  /// 打分后的下次间隔（天）：0 = 短期重排，-1 = 不再出现
   nextInterval Int         @default(0) @map("next_interval")
   /// 来源：study 学习卡片 / list 单词列表的操作与跑步模式里的加进度、已掌握
   source       StudySource @default(study)
